@@ -15,9 +15,7 @@
  * limitations under the License.
  */
 
-
 #include <log4cxx/asyncappender.h>
-
 
 #include <log4cxx/helpers/loglog.h>
 #include <log4cxx/spi/loggingevent.h>
@@ -105,30 +103,34 @@ typedef std::map<LogString, DiscardSummary> DiscardMap;
 #endif
 
 #ifdef __cpp_lib_hardware_interference_size
-    using std::hardware_constructive_interference_size;
-    using std::hardware_destructive_interference_size;
+	using std::hardware_constructive_interference_size;
+	using std::hardware_destructive_interference_size;
 #else
-    // 64 bytes on x86-64 │ L1_CACHE_BYTES │ L1_CACHE_SHIFT │ __cacheline_aligned │ ...
-    constexpr std::size_t hardware_constructive_interference_size = 64;
-    constexpr std::size_t hardware_destructive_interference_size = 64;
+	// 64 bytes on x86-64 │ L1_CACHE_BYTES │ L1_CACHE_SHIFT │ __cacheline_aligned │ ...
+	constexpr std::size_t hardware_constructive_interference_size = 64;
+	constexpr std::size_t hardware_destructive_interference_size = 64;
 #endif
 
 struct AsyncAppender::AsyncAppenderPriv : public AppenderSkeleton::AppenderSkeletonPrivate
 {
-	AsyncAppenderPriv() :
-		AppenderSkeletonPrivate(),
-		buffer(DEFAULT_BUFFER_SIZE),
-		bufferSize(DEFAULT_BUFFER_SIZE),
-		dispatcher(),
-		locationInfo(false),
-		blocking(true)
+	AsyncAppenderPriv()
+		: AppenderSkeletonPrivate()
+		, buffer(DEFAULT_BUFFER_SIZE)
+		, bufferSize(DEFAULT_BUFFER_SIZE)
+		, dispatcher()
+		, locationInfo(false)
+		, blocking(true)
 #if LOG4CXX_EVENTS_AT_EXIT
 		, atExitRegistryRaii([this]{stopDispatcher();})
 #endif
 		, eventCount(0)
 		, dispatchedCount(0)
 		, commitCount(0)
+		{ }
+
+	~AsyncAppenderPriv()
 	{
+		stopDispatcher();
 	}
 
 	/**
@@ -171,10 +173,7 @@ struct AsyncAppender::AsyncAppenderPriv : public AppenderSkeleton::AppenderSkele
 
 	void stopDispatcher()
 	{
-		{
-			std::lock_guard<std::mutex> lock(bufferMutex);
-			closed = true;
-		}
+		this->setClosed();
 		bufferNotEmpty.notify_all();
 		bufferNotFull.notify_all();
 
@@ -212,6 +211,23 @@ struct AsyncAppender::AsyncAppenderPriv : public AppenderSkeleton::AppenderSkele
 	 * Used to communicate to the dispatch thread when an event is committed in buffer.
 	*/
 	alignas(hardware_constructive_interference_size) std::atomic<size_t> commitCount;
+
+	bool isClosed()
+	{
+		std::lock_guard<std::mutex> lock(this->bufferMutex);
+		return this->closed;
+	}
+
+	void setClosed()
+	{
+		std::lock_guard<std::mutex> lock(this->bufferMutex);
+		this->closed = true;
+	}
+
+	/**
+	 * Used to ensure the dispatch thread does not wait when a logging thread is waiting.
+	*/
+	int blockedCount{0};
 };
 
 
@@ -271,16 +287,12 @@ void AsyncAppender::append(const spi::LoggingEventPtr& event, Pool& p)
 		priv->appenders.appendLoopOnAppenders(event, p);
 	}
 
-	// Set the NDC and MDC for the calling thread as these
-	// LoggingEvent fields were not set at event creation time.
-	LogString ndcVal;
-	event->getNDC(ndcVal);
-	// Get a copy of this thread's MDC.
-	event->getMDCCopy();
+	// Get a copy of this thread's diagnostic context
+	event->LoadDC();
 
 	if (!priv->dispatcher.joinable())
 	{
-		std::lock_guard<std::mutex> lock(priv->bufferMutex);
+		std::lock_guard<std::recursive_mutex> lock(priv->mutex);
 		if (!priv->dispatcher.joinable())
 			priv->dispatcher = ThreadUtility::instance()->createThread( LOG4CXX_STR("AsyncAppender"), &AsyncAppender::dispatch, this );
 	}
@@ -306,11 +318,11 @@ void AsyncAppender::append(const spi::LoggingEventPtr& event, Pool& p)
 			priv->bufferNotEmpty.notify_all();
 			break;
 		}
-		priv->bufferNotEmpty.notify_all();
 		//
 		//   Following code is only reachable if buffer is full or eventCount has overflowed
 		//
 		std::unique_lock<std::mutex> lock(priv->bufferMutex);
+		priv->bufferNotEmpty.notify_all();
 		//
 		//   if blocking and thread is not already interrupted
 		//      and not the dispatcher then
@@ -321,10 +333,12 @@ void AsyncAppender::append(const spi::LoggingEventPtr& event, Pool& p)
 			&& !priv->closed
 			&& (priv->dispatcher.get_id() != std::this_thread::get_id()) )
 		{
+			++priv->blockedCount;
 			priv->bufferNotFull.wait(lock, [this]()
 			{
 				return priv->eventCount - priv->dispatchedCount < priv->bufferSize;
 			});
+			--priv->blockedCount;
 			discard = false;
 		}
 
@@ -512,10 +526,10 @@ void AsyncAppender::dispatch()
 		{
 			std::unique_lock<std::mutex> lock(priv->bufferMutex);
 			priv->bufferNotEmpty.wait(lock, [this]() -> bool
-				{ return priv->dispatchedCount != priv->commitCount || priv->closed; }
+				{ return 0 < priv->blockedCount || priv->dispatchedCount != priv->commitCount || priv->closed; }
 			);
 		}
-		isActive = !priv->closed;
+		isActive = !priv->isClosed();
 
 		while (events.size() < priv->bufferSize && priv->dispatchedCount != priv->commitCount)
 		{
@@ -545,7 +559,7 @@ void AsyncAppender::dispatch()
 			}
 			catch (std::exception& ex)
 			{
-				if (isActive)
+				if (!priv->isClosed())
 				{
 					priv->errorHandler->error(LOG4CXX_STR("async dispatcher"), ex, 0, item);
 					isActive = false;
@@ -553,26 +567,27 @@ void AsyncAppender::dispatch()
 			}
 			catch (...)
 			{
-				if (isActive)
+				if (!priv->isClosed())
 				{
 					priv->errorHandler->error(LOG4CXX_STR("async dispatcher"));
 					isActive = false;
 				}
 			}
 		}
-		if (!isActive && LogLog::isDebugEnabled())
+	}
+	if (LogLog::isDebugEnabled())
+	{
+		Pool p;
+		LogString msg(LOG4CXX_STR("AsyncAppender"));
+		msg += LOG4CXX_STR(" discardCount ");
+		StringHelper::toString(discardCount, p, msg);
+		msg += LOG4CXX_STR(" pendingCountHistogram");
+		for (auto item : pendingCountHistogram)
 		{
-			LogString msg(LOG4CXX_STR("AsyncAppender")); 
-			msg += LOG4CXX_STR(" discardCount ");
-			StringHelper::toString(discardCount, p, msg);
-			msg += LOG4CXX_STR(" pendingCountHistogram");
-			for (auto item : pendingCountHistogram)
-			{
-				msg += logchar(' ');
-				StringHelper::toString(item, p, msg);
-			}
-			LogLog::debug(msg);
+			msg += logchar(' ');
+			StringHelper::toString(item, p, msg);
 		}
+		LogLog::debug(msg);
 	}
 
 }
